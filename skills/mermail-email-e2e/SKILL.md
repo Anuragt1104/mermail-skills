@@ -8,7 +8,7 @@ metadata:
         - MERMAIL_API_KEY
     primaryEnv: MERMAIL_API_KEY
     homepage: https://github.com/Anuragt1104/mermail-email-e2e
-    emoji: "🧪"
+    emoji: 🧪
 ---
 
 # Mermail Email E2E
