@@ -25,8 +25,17 @@ const BAD_PARAM_VALUES = new Set(["", "undefined", "null", "nan", "[object objec
  * Normalize a Mermail get_email record (or a test fixture) into the shape the checks use.
  * Mermail returns one `body` string; some records also carry `html`/`text`. Raw headers are optional.
  */
-export function normalizeMessage(record) {
+export function normalizeMessage(record, { capture = "inbox" } = {}) {
   const r = record ?? {};
+  const unavailable = r.content_omitted || r.content_truncated || r.body_storage_status === "deleted";
+  const safe = !unavailable && (r.scan_status === "clean" || (capture === "sent" && r.scan_status == null));
+  // Do not even parse blocked content. Outbound scan exemption is selected by the caller,
+  // after binding the returned id, folder and recipient to the selected Sent copy.
+  if (!safe) return {
+    id: r.id ?? null, scanStatus: r.scan_status ?? null, contentOmitted: true,
+    subject: "", from: "", to: "", date: r.date ?? null, html: "", text: "",
+    headers: {}, senderAuthentication: r.sender_authentication ?? null, attachments: [], hasTextAlternative: null,
+  };
   const body = typeof r.body === "string" ? r.body : "";
   const looksHtml = r.body_format ? r.body_format === "html" : /<\s*(html|body|p|div|a|table|br)\b/i.test(body);
   const html = typeof r.html === "string" ? r.html : looksHtml ? body : "";
@@ -90,7 +99,9 @@ function detectTextAlternative({ html, text, headers, record }) {
   if (typeof record.text_body === "string" && record.text_body.trim()) return true;
   if (!html && text.trim()) return true; // plain-text-only email
   const contentType = headers["content-type"];
-  if (contentType) return /multipart\/(alternative|mixed|related)/i.test(contentType) && !/^text\/html/i.test(contentType);
+  if (/^text\/html/i.test(contentType ?? "")) return false;
+  // A multipart wrapper does not prove that a text/plain child exists.
+  if (/^text\/plain/i.test(contentType ?? "")) return true;
   return null;
 }
 
@@ -194,22 +205,36 @@ export function toRegExp(value) {
   return m ? new RegExp(m[1], m[2]) : null;
 }
 
-/** Redact secrets for reports: keep a short prefix so humans can correlate runs. */
-export function redact(value, keep = 2) {
-  const s = String(value ?? "");
-  if (s.length <= keep) return "*".repeat(s.length);
-  return `${s.slice(0, keep)}${"*".repeat(Math.min(8, s.length - keep))}`;
+/** No recoverable OTP prefix, suffix, length or hash in reports. */
+export function redact() {
+  return "[redacted]";
 }
 
 export function redactUrl(href) {
   const url = parseUrl(href);
-  if (!url) return href;
-  for (const [k, v] of url.searchParams) {
-    if (v.length >= 6 && !BAD_PARAM_VALUES.has(v.toLowerCase())) url.searchParams.set(k, redact(v, 4)); // keep "undefined" visible: it is evidence, not a secret
-  }
-  const parts = url.pathname.split("/").map((seg) => (seg.length >= 20 ? redact(seg, 4) : seg));
-  url.pathname = parts.join("/");
-  return url.toString();
+  if (!url || !["http:", "https:"].includes(url.protocol)) return "[redacted URL]";
+  return `${url.origin}/[redacted]`;
+}
+
+export function usableLink(url, ctx = {}) {
+  return Boolean(url && ["http:", "https:"].includes(url.protocol) && !url.username && !url.password &&
+    (url.protocol === "https:" || (ctx.mode === "dev" && isLocalHost(url.hostname))) &&
+    (ctx.linkHosts?.length ? hostAllowed(url, ctx.linkHosts) : ctx.mode === "dev" && isLocalHost(url.hostname)) &&
+    !/(?:unsubscribe|checkout|payment|delete[-_]?account|account[-_/]?(?:delete|remov))/i.test(decodeURIComponentSafe(url.pathname)));
+}
+
+function decodeURIComponentSafe(value) {
+  try { return decodeURIComponent(value); } catch { return value; }
+}
+
+export function candidateMatches(e, { address, expect = {}, windowStart, windowEnd, folder, baseline = new Set() }) {
+  if (!e || typeof e.id !== "string" || !e.id || baseline.has(e.id)) return false;
+  if (String(e.folder_id ?? e.folder_name ?? e.folder ?? "").toLowerCase() !== folder) return false;
+  const recipients = [].concat(e.recipient ?? e.to ?? []).flatMap((v) => String(v).split(/[,;]/)).map(normalizeAddress);
+  if (!recipients.includes(address)) return false;
+  const date = Date.parse(e.date);
+  if (!Number.isFinite(date) || date < Date.parse(windowStart) || date > windowEnd) return false;
+  return !expect.subject || matchesExpectation(e.subject ?? "", expect.subject);
 }
 
 function result(id, title, status, detail, extra = {}) {
@@ -227,23 +252,24 @@ export function runMessageChecks(message, expect = {}, ctx = {}) {
   const linkHosts = ctx.linkHosts ?? [];
   const mode = ctx.mode ?? "dev";
   const kind = ctx.kind ?? "transactional";
-  const visibleText = [htmlToText(message.html), message.text].filter(Boolean).join("\n");
 
   // Security signals first: they gate how much the rest of the report means.
   if (ctx.capture === "sent" && message.scanStatus == null) out.push(result("SEC-001", "Content scan is clean", STATUS.INFO, "outbound copy read from Sent: Mermail scans inbound mail only"));
   else if (message.scanStatus === "clean") out.push(result("SEC-001", "Content scan is clean", STATUS.PASS, "scan_status=clean"));
   else if (message.scanStatus === "flagged") out.push(result("SEC-001", "Content scan is clean", STATUS.FAIL, "scan_status=flagged: Mermail quarantined this message"));
-  else out.push(result("SEC-001", "Content scan is clean", STATUS.WARN, `scan_status=${message.scanStatus ?? "missing"}; body checks ran on the bounded copy only`));
+  else out.push(result("SEC-001", "Content scan is clean", STATUS.FAIL, "inbound scan is not clean; content checks stopped"));
 
   const auth = message.senderAuthentication?.status;
   if (auth === "pass") out.push(result("SEC-002", "Sender authentication", STATUS.PASS, "sender_authentication.status=pass"));
   else if (auth === "fail") out.push(result("SEC-002", "Sender authentication", STATUS.FAIL, "sender_authentication.status=fail: fix SPF/DKIM/DMARC for the sending domain"));
   else out.push(result("SEC-002", "Sender authentication", STATUS.INFO, `sender_authentication.status=${auth ?? "missing"}: not verifiable on this receiving path (unknown is not pass)`));
 
-  if (message.contentOmitted) {
+  if (message.contentOmitted || message.contentTruncated || message.bodyStorageStatus === "deleted" ||
+      !(message.scanStatus === "clean" || (ctx.capture === "sent" && message.scanStatus == null))) {
     out.push(result("CNT-000", "Body available for checks", STATUS.FAIL, "Mermail omitted the body (content_omitted); content and link checks skipped"));
     return out;
   }
+  const visibleText = [htmlToText(message.html), message.text].filter(Boolean).join("\n");
 
   // Envelope.
   if (expect.from) {
@@ -268,7 +294,7 @@ export function runMessageChecks(message, expect = {}, ctx = {}) {
   const tokens = dedupe([...subjectTokens, ...bodyTokens, ...hrefTokens], (h) => h.token);
   out.push(
     tokens.length
-      ? result("CNT-001", "No unrendered template tokens", STATUS.FAIL, tokens.map((t) => `${t.token} in "${t.context}"`).join("; "), { evidence: tokens })
+      ? result("CNT-001", "No unrendered template tokens", STATUS.FAIL, `${tokens.length} template token(s); surrounding content withheld`)
       : result("CNT-001", "No unrendered template tokens", STATUS.PASS, "no {{…}}, {%…%}, <%…%>, ${…}, *|…|*, undefined, NaN or [object Object]"),
   );
 
@@ -283,7 +309,7 @@ export function runMessageChecks(message, expect = {}, ctx = {}) {
   out.push(result("CNT-003", "No placeholder or forbidden copy", present.length ? STATUS.FAIL : STATUS.PASS, present.length ? `found: ${present.join(", ")}` : "clean"));
 
   if (message.hasTextAlternative === null) {
-    out.push(result("CNT-004", "Plain-text alternative", STATUS.INFO, "cannot tell: the record has no text field or Content-Type header"));
+    out.push(result("CNT-004", "Plain-text alternative", expect.requireText ? STATUS.FAIL : STATUS.INFO, "text/plain part not proven by this record"));
   } else {
     out.push(
       message.hasTextAlternative
@@ -326,7 +352,9 @@ export function runMessageChecks(message, expect = {}, ctx = {}) {
   let cta = null;
   if (expect.link?.pattern) {
     const rx = toRegExp(expect.link.pattern) ?? new RegExp(escapeRegExp(expect.link.pattern));
-    cta = httpLinks.find((l) => rx.test(l.href)) ?? null;
+    const matches = httpLinks.filter((l) => { rx.lastIndex = 0; return rx.test(l.href); });
+    const unique = [...new Set(matches.map((l) => l.href))];
+    cta = unique.length === 1 ? matches[0] : null;
     out.push(result("LNK-003", "Call-to-action link present", cta ? STATUS.PASS : STATUS.FAIL, cta ? redactUrl(cta.href) : `no link matching ${expect.link.pattern}`, { cta: cta?.href ?? null }));
     if (cta) {
       const url = parseUrl(cta.href);
@@ -341,10 +369,13 @@ export function runMessageChecks(message, expect = {}, ctx = {}) {
   // One-time codes.
   if (expect.otp?.pattern) {
     const rx = toRegExp(expect.otp.pattern) ?? new RegExp(expect.otp.pattern);
+    const global = new RegExp(rx.source, [...new Set(rx.flags + "g")].join(""));
+    const distinct = new Set([htmlToText(message.html), message.text].flatMap((part) => [...part.matchAll(global)].map((m) => m[0])));
     const inHtml = htmlToText(message.html).match(rx)?.[0];
     const inText = message.text.match(rx)?.[0];
     const code = inHtml ?? inText;
-    if (!code) out.push(result("OTP-001", "One-time code present", STATUS.FAIL, `no match for ${expect.otp.pattern}`));
+    if (distinct.size > 1) out.push(result("OTP-001", "One-time code present", STATUS.FAIL, "multiple distinct codes; no code selected"));
+    else if (!code) out.push(result("OTP-001", "One-time code present", STATUS.FAIL, `no match for ${expect.otp.pattern}`));
     else if (inHtml && inText && inHtml !== inText) out.push(result("OTP-001", "One-time code present", STATUS.FAIL, "HTML and text parts show different codes"));
     else out.push(result("OTP-001", "One-time code present", STATUS.PASS, `code ${redact(code)} (redacted)`, { otp: code }));
   }
@@ -353,6 +384,15 @@ export function runMessageChecks(message, expect = {}, ctx = {}) {
   if (kind === "marketing") {
     const lu = message.headers["list-unsubscribe"];
     out.push(result("CMP-001", "List-Unsubscribe header", lu ? STATUS.PASS : STATUS.FAIL, lu ? "present" : "missing: Gmail/Yahoo bulk-sender rules require one-click unsubscribe"));
+  }
+
+  // Extracted capabilities never escape a failed check set. The runner applies
+  // the same gate to delivery/selection checks before following or submitting them.
+  if (cta && !usableLink(parseUrl(cta.href), ctx)) {
+    out.push(result("LNK-007", "CTA is an eligible owned-app URL", STATUS.FAIL, "unsupported scheme, credentials, mode, host or sensitive action"));
+  }
+  if (out.some((x) => x.status === STATUS.FAIL)) {
+    for (const check of out) { delete check.cta; delete check.otp; }
   }
 
   return out;
@@ -369,13 +409,16 @@ export function isDeliveryTerminal(record) {
 
 /** DLV-004 for sender-side capture: what Mermail's provider reported for this exact message. */
 export function deliveryReceiptCheck(record) {
+  const top = String(record?.delivery_status ?? "").toLowerCase();
+  const nested = String(record?.provider_metadata?.delivery?.status ?? "").toLowerCase();
+  if (top && nested && top !== nested) return result("DLV-004", "Provider delivered the email", STATUS.FAIL, "conflicting provider delivery evidence; no capability consumed");
   const status = String(record?.delivery_status ?? record?.provider_metadata?.delivery?.status ?? "unknown").toLowerCase();
   const delivery = record?.provider_metadata?.delivery ?? {};
   const via = [delivery.provider, Number.isFinite(delivery.deliveryTimeMs) ? `${delivery.deliveryTimeMs} ms after dispatch` : null].filter(Boolean).join(", ");
   const title = "Provider delivered the email";
   if (DELIVERED.has(status)) return result("DLV-004", title, STATUS.PASS, `delivery_status=delivered${via ? ` (${via})` : ""}`);
   if (FAILED.has(status)) return result("DLV-004", title, STATUS.FAIL, `delivery_status=${status}: the recipient server refused it${via ? ` (${via})` : ""}`);
-  return result("DLV-004", title, STATUS.WARN, `delivery_status=${status}: no final receipt before the deadline`);
+  return result("DLV-004", title, STATUS.FAIL, "no proven final delivered receipt before the deadline");
 }
 
 export function escapeRegExp(s) {

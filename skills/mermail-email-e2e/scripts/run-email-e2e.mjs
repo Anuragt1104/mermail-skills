@@ -12,6 +12,7 @@ import path from "node:path";
 import process from "node:process";
 import {
   STATUS,
+  candidateMatches,
   deliveryReceiptCheck,
   hostAllowed,
   htmlToText,
@@ -25,6 +26,7 @@ import {
   runMessageChecks,
   summarize,
   toRegExp,
+  usableLink,
 } from "./checks.mjs";
 
 const VERSION = "1.0.0";
@@ -33,6 +35,7 @@ if (args.help) usage(0);
 
 const endpoint = process.env.MERMAIL_MCP_URL || "https://console.mermail.app/mcp";
 const apiKey = process.env.MERMAIL_API_KEY;
+const privateValues = new Set(apiKey ? [apiKey] : []);
 const color = process.stdout.isTTY && !process.env.NO_COLOR;
 const c = (code, s) => (color ? `\x1b[${code}m${s}\x1b[0m` : s);
 const ICON = { pass: c(32, "✔"), warn: c(33, "▲"), fail: c(31, "✖"), info: c(36, "ℹ"), skip: c(90, "○") };
@@ -81,6 +84,8 @@ async function runFlow(flow, index) {
   const timeoutSec = flow.timeoutSec ?? spec.defaults?.timeoutSec ?? 120;
   const pollSec = Math.max(Number(process.env.MERMAIL_E2E_MIN_POLL_SEC ?? 5), flow.pollSec ?? spec.defaults?.pollSec ?? 8);
   const maxLatencySec = expect.maxLatencySec ?? spec.defaults?.maxLatencySec ?? 30;
+  const deadline = Date.now() + timeoutSec * 1000;
+  mcp.setDeadline(deadline);
 
   log(`\n${c(1, `▶ ${t.title}`)} ${c(90, `[${flow.id}] → ${address} · capture ${folder}`)}`);
 
@@ -102,7 +107,6 @@ async function runFlow(flow, index) {
   }
 
   // 4. Bounded wait for exactly one new message to this address.
-  const deadline = triggeredAt.getTime() + timeoutSec * 1000;
   let candidates = [];
   let attempts = 0;
   while (Date.now() < deadline) {
@@ -136,6 +140,13 @@ async function runFlow(flow, index) {
     lookedAgain = true;
   }
 
+  if (candidates.length !== 1 || (checkDuplicates && !lookedAgain)) {
+    t.checks.push({ id: "DLV-003", title: "Exactly one email per trigger", status: STATUS.FAIL,
+      detail: candidates.length !== 1 ? "multiple candidates; no message selected or capability consumed" : "deadline reached before duplicate check" });
+    t.state = candidates.length !== 1 ? "ambiguous" : "blocked";
+    return t;
+  }
+
   const first = candidates.sort((a, b) => new Date(a.date) - new Date(b.date))[0];
   const sentAt = first.date ? new Date(first.date) : null;
   const latency = sentAt && sentAt >= triggeredAt ? (sentAt - triggeredAt) / 1000 : null;
@@ -163,7 +174,7 @@ async function runFlow(flow, index) {
     id: "DLV-003",
     title: "Exactly one email per trigger",
     status: candidates.length === 1 ? STATUS.PASS : STATUS.FAIL,
-    detail: candidates.length === 1 ? "no duplicate sends" : `${candidates.length} matching emails: duplicate send or ambiguous match (${candidates.map((x) => x.id).join(", ")})`,
+    detail: checkDuplicates ? "one candidate after a second bounded search" : "one candidate; second duplicate search disabled by the spec",
   });
 
   // 5. Full read of the selected message, size-bounded. Inbound mail is scan-gated; outbound copies are never scanned.
@@ -172,11 +183,23 @@ async function runFlow(flow, index) {
     emailId: first.id,
     query: folder === "sent" ? { max_body_chars: 100000 } : { require_scan_status: "clean", max_body_chars: 100000 },
   });
+  if (record?.id !== first.id || !candidateMatches(record, { address, expect, windowStart, windowEnd: Date.now(), folder, baseline })) {
+    t.checks.push({ id: "SEC-000", title: "Selected message binding", status: STATUS.FAIL, detail: "read does not match selected id, folder, recipient, subject or arrival window" });
+    t.state = "blocked";
+    return t;
+  }
   if (folder === "sent") {
     const receipt = isDeliveryTerminal(record) ? record : first; // the search metadata carries the same receipt fields
     t.checks.push(deliveryReceiptCheck(receipt));
   }
-  const message = normalizeMessage(record);
+  const message = normalizeMessage(record, { capture });
+  if (!message.contentOmitted && expect.otp?.pattern) {
+    const rx = toRegExp(expect.otp.pattern) ?? new RegExp(expect.otp.pattern);
+    for (const part of [htmlToText(message.html), message.text, message.subject]) {
+      const global = new RegExp(rx.source, [...new Set(rx.flags + "g")].join(""));
+      for (const match of part.matchAll(global)) if (match[0]) privateValues.add(match[0]);
+    }
+  }
   t.message = { id: message.id, subject: message.subject, from: message.from, to: message.to, date: message.date, scanStatus: message.scanStatus, capture: folder };
   step(`read ${c(90, message.id)} "${message.subject}"`);
 
@@ -188,8 +211,17 @@ async function runFlow(flow, index) {
   if (otp) vars.otp = otp;
   for (const x of checks) delete x.cta, delete x.otp; // keep secrets out of reports
 
+  if (t.checks.some((x) => x.status === STATUS.FAIL) ||
+      (folder === "sent" && t.checks.find((x) => x.id === "DLV-004")?.status !== STATUS.PASS)) {
+    t.state = "blocked";
+    return t;
+  }
+
   // 6. Follow the call-to-action exactly once, only to user-allowlisted hosts.
-  if (expect.link?.follow && ctaHref) t.checks.push(await followLink(ctaHref, expect.link, ctx));
+  if (expect.link?.follow && ctaHref) {
+    t.checks.push(await followLink(ctaHref, expect.link, ctx, deadline));
+    if (t.checks.at(-1).status !== STATUS.PASS) { t.state = "blocked"; return t; }
+  }
 
   // 7. Assert the app's state changed (the real end of the flow).
   for (const [i, stepSpec] of (flow.then ?? []).entries()) {
@@ -198,12 +230,13 @@ async function runFlow(flow, index) {
       const out = await runAction(stepSpec, vars);
       const problems = [];
       if (stepSpec.expectStatus && out.status !== stepSpec.expectStatus) problems.push(`status ${out.status} ≠ ${stepSpec.expectStatus}`);
-      if (stepSpec.expectJson && !jsonSubsetMatches(out.json, stepSpec.expectJson)) problems.push(`body ${JSON.stringify(out.json)} does not contain ${JSON.stringify(stepSpec.expectJson)}`);
-      if (stepSpec.expectBodyContains && !String(out.body).includes(stepSpec.expectBodyContains)) problems.push(`body missing "${stepSpec.expectBodyContains}"`);
+      if (stepSpec.expectJson && !jsonSubsetMatches(out.json, stepSpec.expectJson)) problems.push("response JSON did not match the expected subset");
+      if (stepSpec.expectBodyContains && !String(out.body).includes(stepSpec.expectBodyContains)) problems.push("response content did not match");
       t.checks.push({ id, title: stepSpec.title ?? `Post-condition: ${describeAction(stepSpec, vars)}`, status: problems.length ? STATUS.FAIL : STATUS.PASS, detail: problems.join("; ") || out.summary });
     } catch (error) {
       t.checks.push({ id, title: stepSpec.title ?? "Post-condition", status: STATUS.FAIL, detail: error.message });
     }
+    if (t.checks.at(-1).status === STATUS.FAIL) break;
   }
 
   for (const x of t.checks) log(`  ${ICON[x.status]} ${c(90, x.id)} ${x.title}${x.status === STATUS.PASS ? "" : c(90, ` — ${x.detail}`)}`);
@@ -223,6 +256,9 @@ function flowAddress(flow, index) {
 
 async function findCandidates({ address, expect, windowStart, baseline, folder }) {
   const subjectHint = typeof expect.subject === "string" && !toRegExp(expect.subject) ? expect.subject.slice(0, 60) : undefined;
+  const all = [];
+  let expectedTotal = null;
+  for (let page = 1; page <= 10; page++) {
   const result = await mcp.call("search_emails", {
     mailboxId: mailbox.public_id,
     query: {
@@ -231,27 +267,36 @@ async function findCandidates({ address, expect, windowStart, baseline, folder }
       ...(subjectHint ? { subject: subjectHint } : {}),
       date_start: windowStart,
       metadata_only: true,
+      agent_safe_content: true,
       include_held: true,
-      page: 1,
+      page,
       limit: 10,
     },
   });
-  return asList(result, "emails").filter((e) => {
-    if (!e?.id || baseline.has(e.id)) return false;
-    const where = String(e.folder_id ?? e.folder_name ?? e.folder ?? folder).toLowerCase();
-    if (!where.includes(folder)) return false; // inbox mode never counts Sent copies, and vice versa
-    const to = String(e.recipient ?? e.to ?? "").toLowerCase().split(/[,;]/).map(normalizeAddress);
-    if (to.length && to[0] && !to.includes(address)) return false;
-    if (expect.subject && !(toRegExp(expect.subject) ?? { test: (s) => s === expect.subject }).test(e.subject ?? "")) return false;
-    return true;
-  });
+  const items = asList(result, "emails");
+  if (result?.totalCount !== undefined) {
+    if (!Number.isSafeInteger(result.totalCount) || result.totalCount < 0 || (expectedTotal !== null && expectedTotal !== result.totalCount)) die("Candidate search changed or returned invalid coverage; selection blocked.");
+    expectedTotal = result.totalCount;
+  }
+  if (items.some((e) => all.some((old) => old.id === e.id))) die("Candidate pagination repeated a message; selection incomplete.");
+  all.push(...items);
+  if (expectedTotal !== null && all.length > expectedTotal) die("Candidate search coverage is inconsistent; selection blocked.");
+  const more = result?.has_more === true || result?.hasMore === true || result?.next_cursor || result?.nextCursor;
+  if (!more && (expectedTotal !== null ? all.length === expectedTotal : items.length < 10)) {
+    return [...new Map(all.filter((e) => candidateMatches(e, { address, expect, windowStart, windowEnd: Date.now(), folder, baseline })).map((e) => [e.id, e])).values()];
+  }
+  if (!items.length || result?.next_cursor || result?.nextCursor) die("Candidate search coverage incomplete within supported pagination.");
+  }
+  die("Candidate search exceeded its page budget; selection is incomplete. No capability consumed.");
 }
 
 async function listRecent(mailboxId, folder) {
   const result = await mcp.call("list_emails", {
     mailboxId,
-    query: { folder, page: 1, limit: 50, sortColumn: "date", sortDirection: "DESC", metadata_only: true },
+    query: { folder, page: 1, limit: 50, sortColumn: "date", sortDirection: "DESC", metadata_only: true, agent_safe_content: true },
   });
+  if (result?.totalCount !== undefined && (!Number.isSafeInteger(result.totalCount) || result.totalCount !== asList(result, "emails").length)) die("Baseline coverage is incomplete; no trigger run.");
+  if (asList(result, "emails").length >= 50 || result?.totalCount > 50) die("Baseline exceeds the bounded test inbox budget; choose a dedicated test mailbox.");
   return asList(result, "emails");
 }
 
@@ -270,43 +315,43 @@ async function resolveMailbox(selector) {
   return m;
 }
 
-async function followLink(href, linkSpec, ctx) {
+async function followLink(href, linkSpec, ctx, deadline) {
   const id = "LNK-006";
   const title = "Call-to-action link works end to end";
   let url = parseUrl(href);
   const hops = [];
   for (let hop = 0; hop <= 5; hop += 1) {
     if (!url) return { id, title, status: STATUS.FAIL, detail: "unparseable URL" };
-    const allowed = ctx.linkHosts.length ? hostAllowed(url, ctx.linkHosts) : isLocalHost(url.hostname);
+    const allowed = usableLink(url, ctx);
     if (!allowed) return { id, title, status: STATUS.FAIL, detail: `refused to follow ${url.host}: not on the spec's linkHosts allowlist` };
     let response;
     try {
-      response = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(15_000) });
+      response = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(timeLeft(deadline, 15_000)) });
     } catch (error) {
       return { id, title, status: STATUS.FAIL, detail: `${redactUrl(url.toString())} unreachable: ${error.cause?.code ?? error.message}` };
     }
-    hops.push(`${response.status} ${url.host}${url.pathname}`);
+    hops.push(`${response.status} ${redactUrl(url.toString())}`);
     const location = response.headers.get("location");
     if (response.status >= 300 && response.status < 400 && location) {
-      url = parseUrl(new URL(location, url).toString());
+      try { url = parseUrl(new URL(location, url).toString()); } catch { url = null; }
       continue;
     }
-    const body = await response.text();
+    const body = await boundedText(response);
     const want = linkSpec.expectStatus ?? 200;
     const problems = [];
     if (response.status !== want) problems.push(`HTTP ${response.status} (expected ${want})`);
     if (linkSpec.expectBodyContains && !body.includes(linkSpec.expectBodyContains)) problems.push(`page missing "${linkSpec.expectBodyContains}"`);
-    const snippet = htmlToText(body).replace(/\s+/g, " ").trim().slice(0, 120);
-    return { id, title, status: problems.length ? STATUS.FAIL : STATUS.PASS, detail: `${hops.join(" → ")}${problems.length ? `: ${problems.join(", ")}; page says "${snippet}"` : ""}` };
+    return { id, title, status: problems.length ? STATUS.FAIL : STATUS.PASS, detail: `${hops.join(" → ")}${problems.length ? ": response did not match expectations; content withheld" : ""}` };
   }
   return { id, title, status: STATUS.FAIL, detail: `too many redirects: ${hops.join(" → ")}` };
 }
 
 async function runAction(action, vars, { strict = false } = {}) {
   if (!action) throw new Error("missing trigger/step definition");
+  if (/\{(?:link|otp)(?:\|url)?\}/.test(JSON.stringify(substitute(action, vars)))) throw new Error("Required email capability unavailable; action not run");
   if (action.http) {
     const h = substitute(action.http, vars);
-    const init = { method: h.method ?? "GET", headers: { ...(h.headers ?? {}) }, signal: AbortSignal.timeout((h.timeoutSec ?? 30) * 1000) };
+    const init = { method: h.method ?? "GET", redirect: "error", headers: { ...(h.headers ?? {}) }, signal: AbortSignal.timeout(mcp.timeLeft((h.timeoutSec ?? 30) * 1000)) };
     if (h.json !== undefined) {
       init.body = JSON.stringify(h.json);
       init.headers["content-type"] ??= "application/json";
@@ -315,16 +360,16 @@ async function runAction(action, vars, { strict = false } = {}) {
     try {
       response = await fetch(h.url, init);
     } catch (error) {
-      throw new Error(`${init.method} ${h.url} failed: ${error.cause?.code ?? error.message}. Is the app running?`);
+      throw new Error(`${init.method} request failed; response content withheld. Is the app running?`);
     }
-    const body = await response.text();
+    const body = await boundedText(response);
     let json = null;
     try {
       json = JSON.parse(body);
     } catch {}
     const wanted = h.expectStatus ?? action.expectStatus;
     if (strict && (wanted ? response.status !== wanted : response.status >= 400)) {
-      throw new Error(`${init.method} ${h.url} → HTTP ${response.status}: ${body.slice(0, 160)}`);
+      throw new Error(`${init.method} request → HTTP ${response.status}; response content withheld`);
     }
     return { status: response.status, body, json, summary: `HTTP ${response.status}` };
   }
@@ -334,14 +379,21 @@ async function runAction(action, vars, { strict = false } = {}) {
     return await new Promise((resolve, reject) => {
       const child = spawn(argv[0], argv.slice(1), { cwd: action.cwd ? path.resolve(path.dirname(specPath), action.cwd) : process.cwd(), shell: false, env: process.env });
       let output = "";
-      child.stdout.on("data", (d) => (output += d));
-      child.stderr.on("data", (d) => (output += d));
-      const timer = setTimeout(() => child.kill("SIGTERM"), (action.timeoutSec ?? 60) * 1000);
+      let oversized = false;
+      const consume = (d) => {
+        if (oversized) return;
+        output += d;
+        if (Buffer.byteLength(output) > 2 * 1024 * 1024) { oversized = true; output = ""; child.kill("SIGKILL"); }
+      };
+      child.stdout.on("data", consume);
+      child.stderr.on("data", consume);
+      const timer = setTimeout(() => child.kill("SIGKILL"), mcp.timeLeft((action.timeoutSec ?? 60) * 1000));
       child.on("error", (e) => (clearTimeout(timer), reject(e)));
       child.on("close", (code) => {
         clearTimeout(timer);
-        if (code === 0) resolve({ status: 0, body: output, json: null, summary: "exit 0" });
-        else reject(new Error(`${argv[0]} exited ${code}: ${output.trim().slice(-200)}`));
+        if (oversized) reject(new Error("Approved command exceeded output budget; output withheld"));
+        else if (code === 0) resolve({ status: 0, body: output, json: null, summary: "exit 0" });
+        else reject(new Error(`Approved command exited ${code}; output withheld`));
       });
     });
   }
@@ -351,48 +403,54 @@ async function runAction(action, vars, { strict = false } = {}) {
 function describeAction(action, vars) {
   if (action?.http) {
     const h = substitute(action.http, vars);
-    return `${h.method ?? "GET"} ${h.url.replace(/[\w.+-]+(?:%40|@)[\w.-]+/g, (m) => m.replace(/^(.{3}).*?(%40|@)/, "$1…$2"))}`;
+    return `${h.method ?? "GET"} ${redactUrl(h.url)}`;
   }
-  if (action?.command) return substitute(action.command, vars).join(" ");
+  if (action?.command) return "approved argv command (arguments withheld)";
   return "(none)";
 }
 
 // ----------------------------------------------------------------------------- MCP client
 
 function createMcpClient({ endpoint, apiKey, rpm }) {
+  if (!Number.isInteger(rpm) || rpm < 1 || rpm > 1000) die("rateLimitRpm must be an integer from1to1000.");
+  let deadline = Date.now() + 120_000;
   const calls = [];
   let nextId = 1;
   let initialized = false;
   const headerName = "x-api-key";
 
-  async function post(body) {
+  async function post(body, attempt = 0) {
+    if (attempt >= 5) die("Mermail retry budget exhausted; no flow retriggered.");
+    timeLeft(deadline);
     // Free plans allow 10 requests/minute per workspace; stay under the configured budget.
     for (;;) {
       const now = Date.now();
       while (calls.length && now - calls[0] > 60_000) calls.shift();
       if (calls.length < rpm) break;
-      await sleep(60_000 - (now - calls[0]) + 50);
+      await waitWithin(60_000 - (now - calls[0]) + 50, deadline);
     }
     calls.push(Date.now());
     const response = await fetch(endpoint, {
       method: "POST",
       headers: { accept: "application/json, text/event-stream", "content-type": "application/json", [headerName]: apiKey },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(timeLeft(deadline, 30_000)),
     });
     if (response.status === 429) {
-      const wait = Number(response.headers.get("retry-after") ?? 10);
-      if (wait > 60) die(`Mermail rate limit: retry after ${wait}s.`);
-      await sleep(wait * 1000);
-      return post(body);
+      const raw = response.headers.get("retry-after");
+      const wait = raw == null ? 10_000 : /^\d+$/.test(raw) ? Number(raw) * 1000 : Date.parse(raw) - Date.now();
+      await response.body?.cancel();
+      if (!Number.isFinite(wait) || wait < 0) die("Invalid Retry-After; stopped without retry.");
+      await waitWithin(wait, deadline);
+      return post(body, attempt + 1);
     }
     if (response.status === 401) die("Mermail rejected the API key (401). Check MERMAIL_API_KEY; do not paste it anywhere.");
     if (response.status === 402) die("Mermail API credits are exhausted for this workspace period (402).");
     if (response.status === 403) die("Mermail returned 403: plan gate, wrong workspace, or missing role.");
     if (!response.ok) die(`Mermail MCP returned HTTP ${response.status}.`);
-    const text = await response.text();
+    const text = await boundedText(response);
     const payload = text.trimStart().startsWith("{") ? JSON.parse(text) : parseSse(text);
-    if (payload.error) die(`Mermail MCP error ${payload.error.code}: ${payload.error.message}`);
+    if (payload.error) die("Mermail MCP returned an error; provider content withheld.");
     return payload.result;
   }
 
@@ -408,10 +466,10 @@ function createMcpClient({ endpoint, apiKey, rpm }) {
       if (/rate_limit_exceeded|too many requests/i.test(text ?? "") && attempt < 4) {
         const wait = 15 * (attempt + 1);
         log(`  ${c(33, "·")} ${c(90, `Mermail rate limit (shared 10 RPM on Free); backing off ${wait}s`)}`);
-        await sleep(wait * 1000);
+        await waitWithin(wait * 1000, deadline);
         return call(name, argumentsObject, attempt + 1);
       }
-      die(`${name} failed: ${(text ?? "unknown error").slice(0, 300)}`);
+      die(`${name} failed; provider content withheld.`);
     }
     if (result?.structuredContent) return result.structuredContent;
     try {
@@ -421,7 +479,33 @@ function createMcpClient({ endpoint, apiKey, rpm }) {
     }
   }
 
-  return { call };
+  return { call, setDeadline(value) { deadline = value; }, timeLeft(max) { return timeLeft(deadline, max); } };
+}
+
+function timeLeft(deadline, max = 30_000) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) die("Flow deadline reached; no action retried or retriggered.");
+  return Math.max(1, Math.min(max, remaining));
+}
+
+async function waitWithin(ms, deadline) {
+  if (!Number.isFinite(ms) || ms < 0 || ms >= deadline - Date.now()) die("Retry or throttle wait exceeds the original deadline; stopped.");
+  await sleep(ms);
+}
+
+async function boundedText(response) {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    bytes += value.byteLength;
+    if (bytes > 2 * 1024 * 1024) { await reader.cancel(); throw new Error("Response exceeds2MiB; content withheld"); }
+    chunks.push(value);
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
 }
 
 function parseSse(text) {
@@ -513,6 +597,7 @@ function buildReport(flows) {
 }
 
 async function writeReports(report) {
+  report = sanitizeOutput(report);
   await mkdir(reportDir, { recursive: true });
   await writeFile(path.join(reportDir, "report.json"), JSON.stringify(report, null, 2));
   await writeFile(path.join(reportDir, "report.md"), toMarkdown(report));
@@ -568,7 +653,16 @@ function step(message, transient = false) {
 }
 
 function log(message) {
-  process.stdout.write(`${message}\n`);
+  process.stdout.write(`${sanitizeOutput(message)}\n`);
+}
+
+function sanitizeOutput(value) {
+  if (Array.isArray(value)) return value.map(sanitizeOutput);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, sanitizeOutput(v)]));
+  if (typeof value !== "string") return value;
+  let safe = value;
+  for (const secret of [...privateValues].sort((a, b) => b.length - a.length)) safe = safe.split(secret).join("[redacted]");
+  return safe.replace(/https?:\/\/[^\s<>"')]+/gi, redactUrl).replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ");
 }
 
 function sleep(ms) {
@@ -576,7 +670,7 @@ function sleep(ms) {
 }
 
 function die(message) {
-  process.stderr.write(`${color ? "\x1b[31m" : ""}mermail-email-e2e: ${message}${color ? "\x1b[0m" : ""}\n`);
+  process.stderr.write(`mermail-email-e2e: ${sanitizeOutput(message)}\n`);
   process.exit(2);
 }
 

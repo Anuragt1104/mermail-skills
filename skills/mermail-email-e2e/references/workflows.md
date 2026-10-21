@@ -41,7 +41,7 @@ Use this when the host is connected with OAuth and `MERMAIL_API_KEY` is not in t
 4. **Duplicate check**: when one candidate appears, search once more after 8 s.
 5. **Read**: `get_email` with `max_body_chars: 100000`, plus `require_scan_status: "clean"` for inbox capture. For sent capture, re-read with `metadata_only: true` until the delivery receipt is final (`DLV-004`).
 6. **Evaluate**: apply [checks.md](checks.md) in order. Extract links from `<a href>` and bare URLs, and the OTP with the spec's pattern.
-7. **Complete**: follow the CTA once if it is allowlisted, then run the `then` steps with the extracted `{link}` or `{otp}`.
+7. **Complete**: only after exact unambiguous selection, complete available content and passing checks, follow the eligible allowlisted CTA once, then run the reviewed `then` steps with the extracted `{link}` or `{otp}`. Stop if the CTA fails; do not consume another capability or continue post-conditions after a failed/unknown gate.
 8. **Report**: one table per flow with IDs, statuses, and redacted evidence.
 
 ## CI

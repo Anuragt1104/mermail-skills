@@ -91,7 +91,7 @@ When the app sends through this Mermail mailbox, run the same baseline and poll 
 }
 ```
 
-This returns the rendered `body` (with `body_format`, usually `html`) plus `raw_headers`, a JSON-encoded `[{"key","value"}]` array whose `content-type` tells whether a text part exists (`multipart/alternative`). These feed the token, link, OTP, and text-part checks. If the response has `content_omitted: true`, report `CNT-000` and stop content checks for that flow. Use `agent_safe_content: true` when you only need to summarize and do not need the raw HTML or hrefs.
+This returns the rendered `body` (with `body_format`, usually `html`) plus `raw_headers`, a JSON-encoded `[{"key","value"}]` array. A multipart wrapper alone does not prove a text/plain child; require explicit text content or report text-part coverage as unavailable. Bind the full read back to the selected native id/envelope before checks. If `content_omitted`, `content_truncated` or `body_storage_status: deleted` is present, report `CNT-000` and stop content checks and all follow-up actions. Use `agent_safe_content: true` for discovery or summaries, not raw deterministic HTML checks.
 
 ## Delivery facts that shape a test setup
 
